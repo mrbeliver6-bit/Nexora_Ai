@@ -1,0 +1,241 @@
+import { KNOWLEDGE_BASE } from "./knowledge_base.js";
+
+const SYSTEM_PROMPT = `
+You are Nexora Assistant, the official AI assistant for Nexora.
+
+Your job is to help prospective partners and existing partners
+understand Nexora's business, watches, commissions, joining process,
+training, sales procedures and team progression.
+
+RULES:
+1. Answer using the Nexora knowledge base.
+2. Never invent prices, commissions, policies or requirements.
+3. Never promise guaranteed income or guaranteed sales.
+4. Explain everything in simple English.
+5. Distinguish product profit from partner commission.
+6. If information is missing, clearly say it needs confirmation.
+7. Never pressure anyone to join.
+8. Never request passwords, OTPs or bank credentials.
+9. Do not claim to check orders or register partners.
+10. Do not reveal API keys or private information.
+`;
+
+async function telegram(token, method, data) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${token}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    }
+  );
+
+  return response.json();
+}
+
+async function sendMessage(token, chatId, text) {
+  const parts = text.match(/[\s\S]{1,4000}/g) || [
+    "I could not generate an answer."
+  ];
+
+  for (const part of parts) {
+    await telegram(token, "sendMessage", {
+      chat_id: chatId,
+      text: part
+    });
+  }
+}
+
+async function askAI(env, question) {
+  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+
+  const endpoint =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    encodeURIComponent(model) +
+    ":generateContent?key=" +
+    encodeURIComponent(env.GEMINI_API_KEY);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text:
+                SYSTEM_PROMPT +
+                "\n\nNEXORA KNOWLEDGE BASE:\n" +
+                KNOWLEDGE_BASE +
+                "\n\nUSER QUESTION:\n" +
+                question
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.2,
+        maxOutputTokens: 900
+      }
+    })
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    console.error("AI error:", JSON.stringify(data));
+
+    if (response.status === 429) {
+      return "Our AI usage limit may have been reached. Please try again later.";
+    }
+
+    return "The AI service is temporarily unavailable. Please try again later.";
+  }
+
+  return (
+    data.candidates?.[0]?.content?.parts
+      ?.map(part => part.text || "")
+      .join("")
+      .trim() ||
+    "I don't have a confirmed answer. Please contact the Nexora team."
+  );
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/") {
+      return new Response("Nexora Assistant is running.");
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/setup"
+    ) {
+      if (
+        !env.WEBHOOK_SECRET ||
+        url.searchParams.get("key") !== env.WEBHOOK_SECRET
+      ) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+
+      const webhookUrl =
+        `${url.origin}/telegram/${env.WEBHOOK_SECRET}`;
+
+      const result = await telegram(
+        env.TELEGRAM_BOT_TOKEN,
+        "setWebhook",
+        {
+          url: webhookUrl,
+          secret_token: env.WEBHOOK_SECRET,
+          allowed_updates: ["message"]
+        }
+      );
+
+      return new Response(JSON.stringify(result), {
+        headers: {
+          "Content-Type": "application/json"
+        }
+      });
+    }
+
+    if (
+      request.method !== "POST" ||
+      url.pathname !== `/telegram/${env.WEBHOOK_SECRET}`
+    ) {
+      return new Response("Not found", { status: 404 });
+    }
+
+    if (
+      !env.WEBHOOK_SECRET ||
+      request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+      ) !== env.WEBHOOK_SECRET
+    ) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const update = await request.json();
+    const message = update.message;
+
+    if (!message?.chat?.id || !message?.text) {
+      return new Response("OK");
+    }
+
+    const chatId = message.chat.id;
+    const question = message.text.trim();
+
+    if (question === "/start" || question === "/help") {
+      await sendMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        "👋 Welcome to Nexora Assistant!\n\n" +
+        "Ask me about:\n" +
+        "⌚ Products and prices\n" +
+        "💰 Commissions\n" +
+        "🚀 Joining Nexora\n" +
+        "📚 Training\n" +
+        "👥 Team progression\n\n" +
+        "Type your question below!"
+      );
+
+      return new Response("OK");
+    }
+
+    if (question === "/about") {
+      await sendMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        "Nexora is a watch-focused business partnership initiative. " +
+        "I can explain its documented products, sales process, " +
+        "commissions and training."
+      );
+
+      return new Response("OK");
+    }
+
+    if (
+      !env.TELEGRAM_BOT_TOKEN ||
+      !env.GEMINI_API_KEY
+    ) {
+      await sendMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        "The bot administrator still needs to configure the AI service."
+      );
+
+      return new Response("OK");
+    }
+
+    await telegram(
+      env.TELEGRAM_BOT_TOKEN,
+      "sendChatAction",
+      {
+        chat_id: chatId,
+        action: "typing"
+      }
+    );
+
+    try {
+      const answer = await askAI(env, question);
+
+      await sendMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        answer
+      );
+    } catch (error) {
+      console.error("Bot error:", error);
+
+      await sendMessage(
+        env.TELEGRAM_BOT_TOKEN,
+        chatId,
+        "Something went wrong. Please try again later."
+      );
+    }
+
+    return new Response("OK");
+  }
+};
